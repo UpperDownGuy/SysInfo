@@ -1,50 +1,50 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.Linq;
 using System.Threading;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Diagnostics;
 using Microsoft.Win32;
-using Newtonsoft.Json;
-using System.Management;
+using Newtonsoft.Json; // Ensure Newtonsoft.Json is installed for logging
 
 class Program
 {
     static void Main()
     {
-        Console.WriteLine("Gathering system information...\n");
+        Console.WriteLine("Select mode:\n1 - Simple\n2 - Advanced");
+        string mode = Console.ReadLine();
+        bool isAdvanced = mode == "2";
+
+        Console.WriteLine("\nGathering system information...\n");
         ShowLoadingBar();
 
         var systemInfo = new
         {
             MachineName = Environment.MachineName,
-            OS = GetOSVersion(),
+            OSVersion = GetOSVersion(),
             ProcessorCount = Environment.ProcessorCount,
-            UserDomainName = Environment.UserDomainName,
+            SystemDirectory = Environment.SystemDirectory,
+            UserDomain = Environment.UserDomainName,
             UserName = Environment.UserName,
-            SystemUptime = GetSystemUptime() + " minutes",
-            Storage = GetStorageInfo(),
-            GPU = GetGPUInfo(),
+            Uptime = GetSystemUptime() + " minutes",
+            Drives = GetStorageInfo(),
+            GPUs = GetGPUInfo(),
             NetworkStatus = CheckNetworkStatus()
         };
 
-        Console.WriteLine("\n--- System Information ---");
+        Console.WriteLine("\n--- System Information ---\n");
         PrintSystemInfo(systemInfo);
 
-        // Check for previous log and compare
-        if (File.Exists("system_log.json"))
-        {
-            Console.WriteLine("\nComparing with previous log...");
-            var previousLog = JsonConvert.DeserializeObject<dynamic>(File.ReadAllText("system_log.json"));
-            CompareLogs(previousLog, systemInfo);
-        }
-        
-        // Ask user if they want to save a log
         Console.Write("\nWould you like to save a log of this run? (y/n): ");
         if (Console.ReadLine()?.ToLower() == "y")
         {
-            SaveLog(systemInfo);
+            SaveLog(systemInfo, isAdvanced);
+            Console.WriteLine("Log saved.");
         }
+
+        Console.WriteLine("\nChecking for changes since last run...");
+        CompareLogs(isAdvanced);
 
         Console.WriteLine("\nExiting in 1 minute...");
         Thread.Sleep(60000);
@@ -56,21 +56,39 @@ class Program
         int totalBlocks = 20;
         for (int i = 0; i < totalBlocks; i++)
         {
-            Thread.Sleep(200);
+            Thread.Sleep(100);
             Console.Write("#");
         }
-        Console.WriteLine("] | Fetched Info!");
-        Thread.Sleep(500);
+        Console.WriteLine("] Done!");
+    }
+
+    static void PrintSystemInfo(dynamic systemInfo)
+    {
+        Console.WriteLine($"Machine Name: {systemInfo.MachineName}");
+        Console.WriteLine($"OS Version: {systemInfo.OSVersion}");
+        Console.WriteLine($"Processor Count: {systemInfo.ProcessorCount}");
+        Console.WriteLine($"System Directory: {systemInfo.SystemDirectory}");
+        Console.WriteLine($"User Domain: {systemInfo.UserDomain}");
+        Console.WriteLine($"User Name: {systemInfo.UserName}");
+        Console.WriteLine($"System Uptime: {systemInfo.Uptime}");
+
+        Console.WriteLine("\n--- Drives ---");
+        foreach (var drive in systemInfo.Drives)
+            Console.WriteLine($"Drive {drive.Name}: {drive.FreeSpace} GB free / {drive.TotalSpace} GB total");
+
+        Console.WriteLine("\n--- GPUs ---");
+        foreach (var gpu in systemInfo.GPUs)
+            Console.WriteLine($"GPU: {gpu}");
+
+        Console.WriteLine($"\nNetwork Status: {systemInfo.NetworkStatus}");
     }
 
     static string GetOSVersion()
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            string version = RuntimeInformation.OSDescription;
             int buildNumber = GetWindowsBuildNumber();
-            if (buildNumber >= 22000) return "Windows 11 (Build " + buildNumber + ")";
-            return version;
+            return buildNumber >= 22000 ? $"Windows 11 (Build {buildNumber})" : RuntimeInformation.OSDescription;
         }
         return Environment.OSVersion.ToString();
     }
@@ -85,23 +103,16 @@ class Program
         catch { return 0; }
     }
 
-    static double GetSystemUptime()
+    static object GetStorageInfo()
     {
-        return Math.Round(Environment.TickCount64 / 60000.0, 2);
-    }
-
-    static List<string> GetStorageInfo()
-    {
-        List<string> drives = new List<string>();
-        foreach (DriveInfo drive in DriveInfo.GetDrives())
-        {
-            if (drive.IsReady)
+        return DriveInfo.GetDrives()
+            .Where(d => d.IsReady)
+            .Select(d => new
             {
-                drives.Add($"{drive.Name} - {Math.Round(drive.TotalSize / (1024.0 * 1024 * 1024), 2)} GB Total, " +
-                           $"{Math.Round(drive.AvailableFreeSpace / (1024.0 * 1024 * 1024), 2)} GB Free");
-            }
-        }
-        return drives;
+                Name = d.Name,
+                TotalSpace = Math.Round(d.TotalSize / (double)(1024 * 1024 * 1024), 2),
+                FreeSpace = Math.Round(d.AvailableFreeSpace / (double)(1024 * 1024 * 1024), 2)
+            }).ToList();
     }
 
     static List<string> GetGPUInfo()
@@ -109,15 +120,24 @@ class Program
         List<string> gpus = new List<string>();
         try
         {
-            using (ManagementObjectSearcher searcher = new ManagementObjectSearcher("select * from Win32_VideoController"))
+            var startInfo = new ProcessStartInfo
             {
-                foreach (ManagementObject obj in searcher.Get())
-                {
-                    gpus.Add(obj["Name"].ToString());
-                }
+                FileName = "powershell",
+                Arguments = "-Command \"Get-WmiObject Win32_VideoController | Select-Object -ExpandProperty Name\"",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using (Process process = Process.Start(startInfo))
+            {
+                process.WaitForExit();
+                while (!process.StandardOutput.EndOfStream)
+                    gpus.Add(process.StandardOutput.ReadLine()?.Trim() ?? "");
             }
         }
         catch { gpus.Add("Unknown GPU"); }
+
         return gpus;
     }
 
@@ -125,86 +145,60 @@ class Program
     {
         try
         {
-            using (var ping = new System.Net.NetworkInformation.Ping())
-            {
-                var reply = ping.Send("8.8.8.8", 1000);
-                return (reply != null && reply.Status == System.Net.NetworkInformation.IPStatus.Success) ? "Connected" : "Disconnected";
-            }
+            return System.Net.NetworkInformation.NetworkInterface.GetIsNetworkAvailable() ? "Connected" : "Disconnected";
         }
         catch { return "Unknown"; }
     }
 
-    static void PrintSystemInfo(dynamic info)
+    static double GetSystemUptime()
     {
-        Console.WriteLine($"Machine Name: {info.MachineName}");
-        Console.WriteLine($"OS Version: {info.OS}");
-        Console.WriteLine($"Processor Count: {info.ProcessorCount}");
-        Console.WriteLine($"User Domain Name: {info.UserDomainName}");
-        Console.WriteLine($"User Name: {info.UserName}");
-        Console.WriteLine($"System Uptime: {info.SystemUptime}");
-        Console.WriteLine($"Network Status: {info.NetworkStatus}");
-
-        Console.WriteLine("\n--- Storage Drives ---");
-        foreach (var drive in info.Storage) Console.WriteLine($"- {drive}");
-
-        Console.WriteLine("\n--- GPUs ---");
-        foreach (var gpu in info.GPU) Console.WriteLine($"- {gpu}");
+        return Math.Round(Environment.TickCount64 / 60000.0, 2);
     }
 
-    static void SaveLog(dynamic info)
+    static void SaveLog(object systemInfo, bool isAdvanced)
     {
-        string json = JsonConvert.SerializeObject(info, Formatting.Indented);
-        File.WriteAllText("system_log.json", json);
-        Console.WriteLine("\nSystem log saved!");
+        string logFile = isAdvanced ? "advanced_log.json" : "simple_log.json";
+        File.WriteAllText(logFile, JsonConvert.SerializeObject(systemInfo, Formatting.Indented));
     }
 
-    static void CompareLogs(dynamic previousLog, dynamic currentLog)
+    static void CompareLogs(bool isAdvanced)
     {
-        int totalFields = 0, unchangedFields = 0;
+        string logFile = isAdvanced ? "advanced_log.json" : "simple_log.json";
+
+        if (!File.Exists(logFile))
+        {
+            Console.WriteLine("No previous log found.");
+            return;
+        }
+
+        var previousLog = JsonConvert.DeserializeObject<Dictionary<string, object>>(File.ReadAllText(logFile));
+        var currentLog = JsonConvert.DeserializeObject<Dictionary<string, object>>(JsonConvert.SerializeObject(new
+        {
+            MachineName = Environment.MachineName,
+            OSVersion = GetOSVersion(),
+            ProcessorCount = Environment.ProcessorCount,
+            SystemDirectory = Environment.SystemDirectory,
+            UserDomain = Environment.UserDomainName,
+            UserName = Environment.UserName,
+            Uptime = GetSystemUptime() + " minutes",
+            Drives = GetStorageInfo(),
+            GPUs = GetGPUInfo(),
+            NetworkStatus = CheckNetworkStatus()
+        }));
 
         Console.WriteLine("\n--- System Changes ---");
+        int totalChanges = 0;
 
-        var previousDict = JsonConvert.DeserializeObject<Dictionary<string, object>>(JsonConvert.SerializeObject(previousLog));
-        var currentDict = JsonConvert.DeserializeObject<Dictionary<string, object>>(JsonConvert.SerializeObject(currentLog));
-
-        foreach (var field in previousDict.Keys)
+        foreach (var key in currentLog.Keys)
         {
-            if (!currentDict.ContainsKey(field)) continue;
-
-            totalFields++;
-            string prevValue = JsonConvert.SerializeObject(previousDict[field]);
-            string currValue = JsonConvert.SerializeObject(currentDict[field]);
-
-            if (prevValue != currValue)
+            if (!previousLog.ContainsKey(key) || previousLog[key]?.ToString() != currentLog[key]?.ToString())
             {
-                if (field == "Storage")
-                {
-                    List<string> prevDrives = JsonConvert.DeserializeObject<List<string>>(prevValue);
-                    List<string> currDrives = JsonConvert.DeserializeObject<List<string>>(currValue);
-
-                    Console.WriteLine("\n--- Storage Changes ---");
-                    for (int i = 0; i < Math.Max(prevDrives.Count, currDrives.Count); i++)
-                    {
-                        string prevDrive = i < prevDrives.Count ? prevDrives[i] : "Not Present";
-                        string currDrive = i < currDrives.Count ? currDrives[i] : "Not Present";
-                        if (prevDrive != currDrive)
-                        {
-                            Console.WriteLine($"Drive {i + 1}: Current: {currDrive} | Previous: {prevDrive}");
-                        }
-                    }
-                }
-                else
-                {
-                    Console.WriteLine($"- {field} | Current: {currValue} | Previous: {prevValue}");
-                }
-            }
-            else
-            {
-                unchangedFields++;
+                totalChanges++;
+                Console.WriteLine($"- {key} | Current: {currentLog[key]} | Previous: {previousLog[key]}");
             }
         }
 
-        double similarity = (double)unchangedFields / totalFields * 100;
-        Console.WriteLine($"\nSystem Similarity: {Math.Round(similarity, 2)}%");
+        double similarity = totalChanges == 0 ? 100 : Math.Round((1 - (double)totalChanges / currentLog.Count) * 100, 2);
+        Console.WriteLine($"\nSystem similarity to last run: {similarity}%");
     }
 }
